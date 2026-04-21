@@ -1,9 +1,25 @@
 import cv2
 import numpy as np
+import dlib
 
-# Load OpenCV's DNN face detector (ships with opencv-python)
-_face_net = None
-_landmark_net = None
+# ---------------------------------------------------------------------------
+# Landmark index ranges (dlib 68-point model)
+# ---------------------------------------------------------------------------
+JAW         = list(range(0, 17))
+RIGHT_BROW  = list(range(17, 22))
+LEFT_BROW   = list(range(22, 27))
+RIGHT_EYE   = list(range(36, 42))
+LEFT_EYE    = list(range(42, 48))
+OUTER_LIP   = list(range(48, 60))
+INNER_LIP   = list(range(60, 68))
+
+## slimming filter through cv2.remap
+
+SLIM_STRENGTH = 0.009  # 0.0 = no effect, tweak here
+
+_face_net  = None
+_predictor = None
+
 
 def _get_face_net():
     global _face_net
@@ -15,15 +31,21 @@ def _get_face_net():
     return _face_net
 
 
+def _get_predictor():
+    global _predictor
+    if _predictor is None:
+        _predictor = dlib.shape_predictor(
+            "models/shape_predictor_68_face_landmarks.dat"
+        )
+    return _predictor
+
+
 def detect_faces(frame):
-    """Returns list of (x, y, w, h) bounding boxes for detected faces."""
     net = _get_face_net()
     h, w = frame.shape[:2]
-    blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300),
-                                  (104.0, 177.0, 123.0))
+    blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104.0, 177.0, 123.0))
     net.setInput(blob)
     detections = net.forward()
-
     faces = []
     for i in range(detections.shape[2]):
         confidence = detections[0, 0, i, 2]
@@ -36,60 +58,99 @@ def detect_faces(frame):
     return faces
 
 
-def apply_bilateral_smoothing(image, diameter=9, sigma_color=75, sigma_space=75):
-    """Bilateral filter: smooths while preserving edges."""
-    return cv2.bilateralFilter(image, diameter, sigma_color, sigma_space)
-
-
-def build_face_mask(frame, face):
-    """Creates an elliptical mask for the face region to localize smoothing."""
+def get_landmarks(frame, face):
+    predictor = _get_predictor()
     x, y, w, h = face
-    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-    center = (x + w // 2, y + h // 2)
-    axes = (w // 2, h // 2)
-    cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
-    # Feather the mask edges so blending looks natural
-    mask = cv2.GaussianBlur(mask, (31, 31), 0)
+    rect = dlib.rectangle(x, y, x + w, y + h)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    shape = predictor(gray, rect)
+    return [(shape.part(i).x, shape.part(i).y) for i in range(68)]
+
+
+def _points_to_mask(shape, indices, frame_shape, padding=0):
+    pts = np.array([shape[i] for i in indices], dtype=np.int32)
+    if padding > 0:
+        center = pts.mean(axis=0)
+        pts = (pts + (pts - center) * padding).astype(np.int32)
+    mask = np.zeros(frame_shape[:2], dtype=np.uint8)
+    cv2.fillConvexPoly(mask, cv2.convexHull(pts), 255)
     return mask
 
 
-def correct_skin_tone(image):
-    """Subtle warmth boost + redness reduction in skin tones."""
-    result = image.astype(np.float32)
-    # Slight warmth: boost red/green, reduce blue very mildly
-    result[:, :, 2] = np.clip(result[:, :, 2] * 1.04, 0, 255)  # Red
-    result[:, :, 1] = np.clip(result[:, :, 1] * 1.02, 0, 255)  # Green
-    result[:, :, 0] = np.clip(result[:, :, 0] * 0.97, 0, 255)  # Blue
-    return result.astype(np.uint8)
+def build_skin_mask(frame, face, landmarks):
+    x, y, w, h = face
+    face_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    center = (x + w // 2, y + h // 2)
+    cv2.ellipse(face_mask, center, (w // 2, h // 2), 0, 0, 360, 255, -1)
+    for indices, padding in [
+        (RIGHT_EYE,  0.35), (LEFT_EYE,   0.35),
+        (RIGHT_BROW, 0.2),  (LEFT_BROW,  0.2),
+        (OUTER_LIP,  0.15), (INNER_LIP,  0.15),
+    ]:
+        feature_mask = _points_to_mask(landmarks, indices, frame.shape, padding)
+        face_mask = cv2.subtract(face_mask, feature_mask)
+    face_mask = cv2.GaussianBlur(face_mask, (21, 21), 0)
+    return face_mask
+
+
+def slim_face(frame, landmarks):
+    """
+    Warps jaw landmarks inward toward the face center using cv2.remap.
+    Effect fades naturally away from each jaw point via radial falloff.
+    """
+    h, w = frame.shape[:2]
+    map_x = np.arange(w, dtype=np.float32)
+    map_y = np.arange(h, dtype=np.float32)
+    map_x, map_y = np.meshgrid(map_x, map_y)
+
+    all_pts = np.array(landmarks, dtype=np.float32)
+    face_center = all_pts.mean(axis=0)
+
+    jaw_pts = [landmarks[i] for i in JAW]
+    for pt in jaw_pts:
+        px, py = float(pt[0]), float(pt[1])
+        dx = face_center[0] - px
+        dy = face_center[1] - py
+        dist_to_center = np.sqrt(dx * dx + dy * dy) + 1e-6
+        nx, ny = dx / dist_to_center, dy / dist_to_center
+        radius = dist_to_center * 0.55
+        pixel_dist = np.sqrt((map_x - px) ** 2 + (map_y - py) ** 2)
+        weight = np.clip(1.0 - pixel_dist / radius, 0, 1) ** 2
+        pull = SLIM_STRENGTH * dist_to_center * weight
+        map_x -= pull * nx
+        map_y -= pull * ny
+
+    return cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR,
+                     borderMode=cv2.BORDER_REFLECT)
 
 
 def apply_beauty_filter(frame):
     """
-    Main beauty filter pipeline:
-    1. Detect faces using DNN model
-    2. Build a feathered elliptical face mask
-    3. Apply bilateral smoothing to face region only
-    4. Apply subtle skin tone correction
-    5. Composite smoothed face back onto original frame
+    Full beauty pipeline:
+    1. Detect face + get 68-point landmarks
+    2. Bilateral smooth skin (feature-aware mask preserves eyes/lips/brows)
+    3. Slim jaw via landmark-guided warp
     """
     output = frame.copy()
     faces = detect_faces(frame)
-
     if not faces:
-        return output  # No face detected — return original frame unchanged
+        return output
+
+
+    ##change last two values to edit smooth
+    smoothed = cv2.bilateralFilter(frame, 15, 14, 14)
+    result = smoothed.astype(np.float32)
+    result[:, :, 2] = np.clip(result[:, :, 2] * 1.04, 0, 255)
+    result[:, :, 1] = np.clip(result[:, :, 1] * 1.02, 0, 255)
+    result[:, :, 0] = np.clip(result[:, :, 0] * 0.97, 0, 255)
+    smoothed = result.astype(np.uint8)
 
     for face in faces:
-        # Step 1: Build feathered mask for this face
-        mask = build_face_mask(frame, face)
+        landmarks = get_landmarks(frame, face)
+        mask = build_skin_mask(frame, face, landmarks)
         mask_3ch = cv2.merge([mask, mask, mask]).astype(np.float32) / 255.0
-
-        # Step 2: Smooth the full frame then isolate with mask
-        smoothed = apply_bilateral_smoothing(frame)
-        smoothed = correct_skin_tone(smoothed)
-
-        # Step 3: Alpha-composite: blend smoothed face onto original
-        output = (frame.astype(np.float32) * (1 - mask_3ch) +
-                  smoothed.astype(np.float32) * mask_3ch)
-        output = output.astype(np.uint8)
+        output = (output.astype(np.float32) * (1 - mask_3ch) +
+                  smoothed.astype(np.float32) * mask_3ch).astype(np.uint8)
+        output = slim_face(output, landmarks)
 
     return output
