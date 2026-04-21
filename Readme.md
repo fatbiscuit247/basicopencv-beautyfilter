@@ -1,5 +1,6 @@
-# opencv-beautyfilter
+# basicopencv-beautyfilter
 
+Implemented basic smoothing filter. 
 A real-time beauty filter using OpenCV's DNN face detector and bilateral smoothing.  
 Built as a side project to explore computer vision fundamentals — face detection, facial masking, and selective image processing.
 
@@ -36,6 +37,7 @@ python main.py
 |-----|--------|
 | `q` | Quit |
 | `s` | Save snapshot as `snapshot.jpg` |
+| `r` | Edit in `filter.py` |
 
 ## Project structure
 
