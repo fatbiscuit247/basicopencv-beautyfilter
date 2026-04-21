@@ -23,6 +23,15 @@ cd opencv-beautyfilter
 # 2. Install dependencies
 pip install -r requirements.txt
 
+# Mac/Linux
+pip install -r requirements.txt  # dlib builds from source, requires cmake
+brew install cmake  # if cmake is missing
+
+# Windows
+pip install dlib-bin  # use this instead of dlib
+
+
+
 # 3. Download model files
 python download_models.py
 
