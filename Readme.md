@@ -1,8 +1,9 @@
 # basicopencv-beautyfilter
 
-Implemented basic smoothing filter. 
+Implemented basic smoothing and slimming filter. 
 A real-time beauty filter using OpenCV's DNN face detector and bilateral smoothing.  
-Built as a side project to explore computer vision fundamentals — face detection, facial masking, and selective image processing.
+
+Side project to explore computer vision fundamentals — face detection, facial masking, and selective image processing.
 
 ## How it works
 
